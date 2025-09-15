@@ -1,0 +1,4 @@
+faster-whisper
+requests
+torch
+nanoid
