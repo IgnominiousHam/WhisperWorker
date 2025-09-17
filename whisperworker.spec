@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['whisperworker.py'],
+    ['whisperworkerinput.py'],
     pathex=[],
     binaries=[],
     datas=[],
