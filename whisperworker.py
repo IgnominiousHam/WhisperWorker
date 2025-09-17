@@ -410,6 +410,9 @@ class WorkerClient:
             if hasattr(info, 'language') and info.language == 'nn':
                 self.logger.info(f"Detected language 'nn', skipping DB and file append...")
                 return None
+            if hasattr(info, 'language') and info.language == 'ro':
+                self.logger.info(f"Detected language 'ro', skipping DB and file append...")
+                return None
             if hasattr(info, 'language_probability') and info.language_probability < 0.5:
                 self.logger.info(f"Language confidence {getattr(info, 'language_probability', 0):.2f} < 0.5, skipping...")
                 return None
