@@ -5,7 +5,7 @@ a = Analysis(
     ['whisperworker.py'],
     pathex=[],
     binaries=[],
-    datas=[('book.ico', '.')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['book.ico'],
 )
