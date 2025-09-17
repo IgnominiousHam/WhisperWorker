@@ -12,16 +12,16 @@ import nanoid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
-
+import uuid
 import requests
 from faster_whisper import WhisperModel
-
+import argparse
+import re
 
 class WorkerClient:
-    def __init__(self, server_url: str, worker_name: str, capabilities: str = "transcription", max_concurrent: int = 4, username: str = None, password: str = None):
+    def __init__(self, server_url: str, worker_name: str, max_concurrent: int = 4, username: str = None, password: str = None):
         self.server_url = server_url.rstrip('/')
         self.worker_name = worker_name
-        self.capabilities = capabilities
         self.worker_id = nanoid.generate(size=10)
         self.max_concurrent = max_concurrent  # Maximum concurrent downloads/processing
         self.running = False
@@ -64,7 +64,7 @@ class WorkerClient:
             
             self.logger.info(f"Using device: {device}, compute_type: {compute_type}")
             self.whisper_model = WhisperModel(
-                "base",  # You can make this configurable
+                "small",  # You can make this configurable
                 device=device,
                 compute_type=compute_type
             )
@@ -89,8 +89,7 @@ class WorkerClient:
                 f"{self.server_url}/api/workers/register",
                 json={
                     "worker_id": self.worker_id,
-                    "name": self.worker_name,
-                    "capabilities": self.capabilities
+                    "name": self.worker_name
                 },
                 timeout=10
             )
@@ -183,11 +182,11 @@ class WorkerClient:
                             # Process the audio file
                             result = self.process_audio_file(temp_path, filename)
                             
-                            if result:
+                            if result and self.is_coherent_transcript(result.get("transcript", "")):
                                 # Submit successful result
                                 self.submit_result(task_id, True, result)
                             else:
-                                # No meaningful transcript found
+                                # No meaningful or incoherent transcript found
                                 self.submit_result(task_id, True, None)
                         else:
                             # Download failed
@@ -276,6 +275,83 @@ class WorkerClient:
         minutes = int(seconds // 60)
         seconds = int(seconds % 60)
         return f"{minutes:02d}:{seconds:02d}"
+    
+
+    def is_coherent_transcript(self, text):
+        """Return True if transcript is coherent (not blank, not repetitive, not gibberish, not just Unicode blocks, not sound effects)."""
+        if not text or not text.strip():
+            return False
+        cleaned = text.strip()
+        # Exclude if a single phrase is repeated more than twice (e.g. 'I don't know what I'm talking about' repeated)
+        phrase_counts = {}
+        for line in cleaned.splitlines():
+            phrase = line.strip()
+            if phrase:
+                phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
+        if phrase_counts and max(phrase_counts.values()) > 3:
+            return False
+        # Exclude repeated syllables or short words separated by punctuation (e.g. 'Bă, bă, bă, bă, bă, bă!')
+        if re.fullmatch(r'(\b\w{1,4}[,!?\s]*){3,}', cleaned, re.IGNORECASE):
+            return False
+        # Exclude if a single short word (<=4 chars) is repeated in multiple lines (e.g. 'You' repeated)
+        short_word_counts = {}
+        for line in cleaned.splitlines():
+            word = line.strip()
+            if word and len(word) <= 4:
+                short_word_counts[word] = short_word_counts.get(word, 0) + 1
+        if short_word_counts and max(short_word_counts.values()) > 2:
+            return False
+        # Exclude if more than 60% of characters are not letters or spaces (gibberish, Unicode blocks)
+        non_letter_ratio = sum(1 for c in cleaned if not (c.isalpha() or c.isspace())) / max(1, len(cleaned))
+        if non_letter_ratio > 0.6:
+            return False
+        if len(cleaned) < 5:
+            return False
+        # Exclude repeated single word/character (e.g. 'You You You', 'ლლლლლლლლ')
+        if re.fullmatch(r'(\w+)( \1){2,}', cleaned):
+            return False
+        if re.fullmatch(r'([\W_])\1{4,}', cleaned):
+            return False
+        # Exclude mostly non-ASCII or gibberish
+        ascii_ratio = sum(1 for c in cleaned if ord(c) < 128) / max(1, len(cleaned))
+        if ascii_ratio < 0.3:
+            return False
+        # Exclude mostly punctuation or dots
+        if re.fullmatch(r'[.\s]+', cleaned):
+            return False
+        # Exclude repeated lines (e.g. 'Thank you for watching!' 10x)
+        lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+        if lines and len(set(lines)) == 1 and len(lines) > 3:
+            return False
+        # Exclude onomatopoeia and sound effects (e.g. 'BOOM!', 'BEEP!', 'BUUUU...')
+        if re.fullmatch(r'(BEEP!|BOOM!|BU+H*!|BU+U+U+)', cleaned, re.IGNORECASE):
+            return False
+        # Exclude repetitive syllables (e.g. 'Buh-Buh-Buh-Buh-Buh-Buh-Buh-Buh-Buh!')
+        if re.fullmatch(r'((\w+-){3,}\w+!?)', cleaned):
+            return False
+        # Exclude single-word exclamations or sound effects
+        if re.fullmatch(r'[A-Z]{2,}!?', cleaned):
+            return False
+        # Exclude 'Thank you for watching' and similar phrases
+        thank_you_patterns = [
+            r'^thank you for watching!?$',
+            r'^thanks for watching!?$',
+            r'^thank you very much for watching( and i\'ll see you in the next video\.)?$',
+            r'^thank you\.?$',
+            r'^thanks$',
+            r'^thank you very much\.?$',
+            r'^thank you for watching this video\.?$',
+            r'^i hope you enjoyed it\.?$',
+            r'^i\'ll see you in the next video\.?$',
+            r'^bye!?$',
+            r'^Thank you very much for watching, please subscribe and hit that like button!?$',
+            r'^You\.?$'
+        ]
+        for pat in thank_you_patterns:
+            if re.fullmatch(pat, cleaned, re.IGNORECASE):
+                return False
+        return True
+    
             
     def process_audio_file(self, file_path: str, filename: str) -> Optional[Dict]:
         """Process audio file and return transcription"""
@@ -330,6 +406,14 @@ class WorkerClient:
             dtg = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             task_uuid = str(uuid.uuid4())
             
+            # Language checks before returning transcription
+            if hasattr(info, 'language') and info.language == 'nn':
+                self.logger.info(f"Detected language 'nn', skipping DB and file append...")
+                return None
+            if hasattr(info, 'language_probability') and info.language_probability < 0.5:
+                self.logger.info(f"Language confidence {getattr(info, 'language_probability', 0):.2f} < 0.5, skipping...")
+                return None
+
             # Build transcription result in database format
             transcription = {
                 "dtg": dtg,
@@ -342,7 +426,7 @@ class WorkerClient:
                 "filename": filename,
                 "uuid": task_uuid
             }
-            
+
             self.logger.info(f"Successfully transcribed {filename} ({info.language}, {total_duration:.2f}s, {segment_count} segments)")
             return transcription
             
@@ -451,43 +535,26 @@ class WorkerClient:
 
 
 def main():
-    print("WhisperWorker Configuration")
-    print("=" * 50)
+    parser = argparse.ArgumentParser(description="WhisperWorker Client")
+    parser.add_argument("--server-url", required=True, help="WhisperWatch server URL")
+    parser.add_argument("--username", required=True, help="Username for authentication")
+    parser.add_argument("--password", required=True, help="Password for authentication")
+    parser.add_argument("--worker-name", required=True, help="Worker ID/name")
+    parser.add_argument("--max-concurrent", type=int, default=4, help="Max concurrent tasks (1-10, default: 4)")
 
-    server_url = input("Enter WhisperWatch URL: ").strip()
-    if not server_url:
-        print("URL is required. Exiting...")
-        exit(1)
+    args = parser.parse_args()
 
-    username = input("Enter username: ").strip()
-    if not username:
-        print("Username is required. Exiting...")
-        exit(1)
-
-    password = input("Enter password: ").strip()  
-    if not password:
-        print("Password is required. Exiting...")
-        exit(1)
-
-    worker_name = input("Enter worker ID: ").strip()
-    if not worker_name:
-        print("Worker ID is required. Exiting...")
-        exit(1)
-
-    # For manual capabilities input
-    #capabilities = input("Enter worker capabilities (default: transcription): ").strip() or "transcription"
-    try:
-        max_concurrent = int(input("Enter max concurrent tasks (1-10, default: 4): ").strip() or "4")
-    except ValueError:
-        print("Error: Max concurrent must be an integer.")
-        return 1
-    if max_concurrent < 1 or max_concurrent > 10:
+    if args.max_concurrent < 1 or args.max_concurrent > 10:
         print("Error: Max concurrent must be between 1 and 10")
         return 1
 
-    
-    capabilities = "transcription"  # Default capability
-    worker = WorkerClient(server_url, worker_name, capabilities, max_concurrent, username, password)
+    worker = WorkerClient(
+        args.server_url,
+        args.worker_name,
+        args.max_concurrent,
+        args.username,
+        args.password
+    )
     return worker.run()
 
 
