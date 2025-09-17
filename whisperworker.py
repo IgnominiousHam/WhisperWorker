@@ -282,6 +282,9 @@ class WorkerClient:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+        # Remove common timestamp prefixes like "[00:01-00:05] " so patterns match lines without timestamps
+        # Operate on a timestamp-free copy for pattern matching
+        plain = re.sub(r"\[\d{1,2}:\d{2}-\d{1,2}:\d{2}\]\s*", "", cleaned)
         # Exclude if a single phrase is repeated more than twice (e.g. 'I don't know what I'm talking about' repeated)
         phrase_counts = {}
         for line in cleaned.splitlines():
@@ -289,9 +292,11 @@ class WorkerClient:
             if phrase:
                 phrase_counts[phrase] = phrase_counts.get(phrase, 0) + 1
         if phrase_counts and max(phrase_counts.values()) > 3:
+            self.logger.debug("Excluding: repeated phrase >3")
             return False
         # Exclude repeated syllables or short words separated by punctuation (e.g. 'Bă, bă, bă, bă, bă, bă!')
-        if re.fullmatch(r'(\b\w{1,4}[,!?\s]*){3,}', cleaned, re.IGNORECASE):
+        if re.fullmatch(r'(\b\w{1,4}[,!?\s]*){3,}', plain, re.IGNORECASE):
+            self.logger.debug("Excluding: repeated short-word pattern")
             return False
         # Exclude if a single short word (<=4 chars) is repeated in multiple lines (e.g. 'You' repeated)
         short_word_counts = {}
@@ -300,37 +305,48 @@ class WorkerClient:
             if word and len(word) <= 4:
                 short_word_counts[word] = short_word_counts.get(word, 0) + 1
         if short_word_counts and max(short_word_counts.values()) > 2:
+            self.logger.debug("Excluding: repeated short word across lines")
             return False
         # Exclude if more than 60% of characters are not letters or spaces (gibberish, Unicode blocks)
         non_letter_ratio = sum(1 for c in cleaned if not (c.isalpha() or c.isspace())) / max(1, len(cleaned))
         if non_letter_ratio > 0.6:
+            self.logger.debug("Excluding: high non-letter ratio (gibberish)")
             return False
         if len(cleaned) < 5:
+            self.logger.debug("Excluding: too short")
             return False
         # Exclude repeated single word/character (e.g. 'You You You', 'ლლლლლლლლ')
-        if re.fullmatch(r'(\w+)( \1){2,}', cleaned):
+        if re.fullmatch(r'(\w+)( \1){2,}', plain):
+            self.logger.debug("Excluding: repeated single word")
             return False
-        if re.fullmatch(r'([\W_])\1{4,}', cleaned):
+        if re.fullmatch(r'([\W_])\1{4,}', plain):
+            self.logger.debug("Excluding: repeated symbol sequence")
             return False
         # Exclude mostly non-ASCII or gibberish
         ascii_ratio = sum(1 for c in cleaned if ord(c) < 128) / max(1, len(cleaned))
         if ascii_ratio < 0.3:
+            self.logger.debug("Excluding: low ASCII ratio")
             return False
         # Exclude mostly punctuation or dots
-        if re.fullmatch(r'[.\s]+', cleaned):
+        if re.fullmatch(r'[.\s]+', plain):
+            self.logger.debug("Excluding: only dots/whitespace")
             return False
         # Exclude repeated lines (e.g. 'Thank you for watching!' 10x)
-        lines = [l.strip() for l in cleaned.splitlines() if l.strip()]
+        lines = [l.strip() for l in plain.splitlines() if l.strip()]
         if lines and len(set(lines)) == 1 and len(lines) > 3:
+            self.logger.debug("Excluding: repeated identical line")
             return False
         # Exclude onomatopoeia and sound effects (e.g. 'BOOM!', 'BEEP!', 'BUUUU...')
-        if re.fullmatch(r'(BEEP!|BOOM!|BU+H*!|BU+U+U+)', cleaned, re.IGNORECASE):
+        if re.fullmatch(r'(BEEP!|BOOM!|BU+H*!|BU+U+U+)', plain, re.IGNORECASE):
+            self.logger.debug("Excluding: onomatopoeia/sound effect")
             return False
         # Exclude repetitive syllables (e.g. 'Buh-Buh-Buh-Buh-Buh-Buh-Buh-Buh-Buh!')
-        if re.fullmatch(r'((\w+-){3,}\w+!?)', cleaned):
+        if re.fullmatch(r'((\w+-){3,}\w+!?)', plain):
+            self.logger.debug("Excluding: repetitive syllable pattern")
             return False
         # Exclude single-word exclamations or sound effects
-        if re.fullmatch(r'[A-Z]{2,}!?', cleaned):
+        if re.fullmatch(r'[A-Z]{2,}!?', plain):
+            self.logger.debug("Excluding: all-caps exclamation")
             return False
         # Exclude 'Thank you for watching' and similar phrases
         thank_you_patterns = [
@@ -347,8 +363,15 @@ class WorkerClient:
             r'^Thank you very much for watching, please subscribe and hit that like button!?$',
             r'^You\.?$'
         ]
+        # Check thank-you / bye phrases on a per-line basis (stripped of timestamps)
         for pat in thank_you_patterns:
-            if re.fullmatch(pat, cleaned, re.IGNORECASE):
+            for line in lines:
+                if re.fullmatch(pat, line, re.IGNORECASE):
+                    self.logger.debug(f"Excluding by thank-you pattern: {pat} matched line: {line}")
+                    return False
+            # Also check the whole plain text as a fallback
+            if re.fullmatch(pat, plain, re.IGNORECASE):
+                self.logger.debug(f"Excluding by thank-you pattern on whole text: {pat}")
                 return False
         return True
     
