@@ -306,9 +306,9 @@ class WorkerClient:
         if short_word_counts and max(short_word_counts.values()) > 2:
             self.logger.debug("Excluding: repeated short word across lines")
             return False
-        # Exclude if more than 60% of characters are not letters or spaces (gibberish, Unicode blocks)
+        # Exclude if more than 80% of characters are not letters or spaces (gibberish, Unicode blocks)
         non_letter_ratio = sum(1 for c in cleaned if not (c.isalpha() or c.isspace())) / max(1, len(cleaned))
-        if non_letter_ratio > 0.6:
+        if non_letter_ratio > 0.8:
             self.logger.debug("Excluding: high non-letter ratio (gibberish)")
             return False
         if len(cleaned) < 5:
