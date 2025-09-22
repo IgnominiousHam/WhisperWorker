@@ -2,3 +2,6 @@ faster-whisper
 requests
 torch
 nanoid
+pyannote.audio
+scikit-learn
+torchaudio
