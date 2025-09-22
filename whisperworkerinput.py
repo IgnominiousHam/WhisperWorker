@@ -15,7 +15,6 @@ from typing import Dict, Optional
 import uuid
 import requests
 from faster_whisper import WhisperModel
-import argparse
 import re
 import numpy as np
 
