@@ -17,22 +17,41 @@ import requests
 from faster_whisper import WhisperModel
 import argparse
 import re
+import numpy as np
+from dotenv import load_dotenv
+
+# Load environment variables from .env if present
+load_dotenv()
+
+# Try to import speaker processing dependencies
+try:
+    import torch
+    import torchaudio
+    from pyannote.audio import Pipeline, Model, Inference
+    from sklearn.preprocessing import normalize
+    HAS_SPEAKER_DEPS = True
+except ImportError:
+    HAS_SPEAKER_DEPS = False
 
 class WorkerClient:
-    def __init__(self, server_url: str, worker_name: str, max_concurrent: int = 4, username: str = None, password: str = None):
+    def __init__(self, server_url: str, worker_name: str, max_concurrent: int = 4, username: str = None, password: str = None, mode: str = "transcription", hf_token: Optional[str] = None):
         self.server_url = server_url.rstrip('/')
         self.worker_name = worker_name
         self.worker_id = nanoid.generate(size=10)
         self.max_concurrent = max_concurrent  # Maximum concurrent downloads/processing
+        self.mode = mode  # "transcription" or "embedding"
         self.running = False
         self.whisper_model = None
-        self._model_lock = threading.Lock()  # Protect Whisper model access
+        self.speaker_models = {}  # For speaker embedding models
+        self._model_lock = threading.Lock()  # Protect model access
         self._task_queue = queue.Queue(maxsize=self.max_concurrent * 2)  # Buffer for tasks
         self._active_workers = 0
         self._workers_lock = threading.Lock()
         self.username = username
         self.password = password
-        
+        # Prefer explicit token, else environment
+        self.hf_token = hf_token or os.getenv("HUGGINGFACE_TOKEN")
+
         # Setup logging
         logging.basicConfig(
             level=logging.INFO,
@@ -73,6 +92,179 @@ class WorkerClient:
         except Exception as e:
             self.logger.error(f"Failed to initialize Whisper model: {e}")
             return False
+
+    def initialize_speaker_models(self):
+        """Initialize speaker embedding models"""
+        if not HAS_SPEAKER_DEPS:
+            self.logger.error("Speaker processing dependencies not available")
+            return False
+            
+        try:
+            self.logger.info("Initializing speaker embedding models...")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.logger.info(f"Using device: {device}")
+            if not self.hf_token:
+                self.logger.warning("HUGGINGFACE_TOKEN not set. pyannote models require an access token. Provide via .env or --hf-token.")
+            
+            # Initialize diarization pipeline
+            try:
+                # Try latest stable first
+                self.speaker_models['diarization'] = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization",
+                    use_auth_token=self.hf_token
+                )
+                self.logger.info("Diarization pipeline initialized (pyannote/speaker-diarization)")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize diarization pipeline 'pyannote/speaker-diarization': {e}")
+                # Fallback to a specific version
+                try:
+                    self.speaker_models['diarization'] = Pipeline.from_pretrained(
+                        "pyannote/speaker-diarization-3.1",
+                        use_auth_token=self.hf_token
+                    )
+                    self.logger.info("Diarization pipeline initialized (pyannote/speaker-diarization-3.1)")
+                except Exception as e2:
+                    self.logger.warning(f"Failed fallback diarization pipeline 'pyannote/speaker-diarization-3.1': {e2}")
+                    self.speaker_models['diarization'] = None
+            
+            # Initialize embedding model
+            try:
+                embedding_model = Model.from_pretrained(
+                    "pyannote/embedding", 
+                    use_auth_token=self.hf_token
+                )
+                self.speaker_models['embedding'] = Inference(embedding_model, window="whole")
+                self.logger.info("Embedding model initialized (pyannote/embedding)")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize embedding model: {e}")
+                self.speaker_models['embedding'] = None
+            
+            if not any(self.speaker_models.values()):
+                self.logger.error("No speaker models could be initialized. Ensure pyannote.audio deps are installed and HUGGINGFACE_TOKEN is valid.")
+                return False
+                
+            self.logger.info("Speaker models initialized successfully")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Failed to initialize speaker models: {e}")
+            return False
+            
+    def preprocess_audio_for_speaker(self, audio_path, target_sample_rate=16000):
+        """Load and preprocess audio for speaker processing"""
+        try:
+            waveform, sample_rate = torchaudio.load(audio_path)
+            
+            # Convert to mono if stereo
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            # Resample to target sample rate if needed
+            if sample_rate != target_sample_rate:
+                resampler = torchaudio.transforms.Resample(
+                    orig_freq=sample_rate, 
+                    new_freq=target_sample_rate
+                )
+                waveform = resampler(waveform)
+            
+            return waveform, target_sample_rate
+        except Exception as e:
+            self.logger.error(f"Error preprocessing audio: {e}")
+            return None, None
+
+    def process_speaker_embeddings(self, file_path: str, filename: str) -> Optional[Dict]:
+        """Process audio file for speaker embeddings"""
+        try:
+            self.logger.info(f"Processing speaker embeddings for: {filename}")
+            
+            if not self.speaker_models.get('diarization') or not self.speaker_models.get('embedding'):
+                self.logger.error("Speaker models not properly initialized")
+                if not self.speaker_models.get('diarization'):
+                    self.logger.error("Diarization pipeline unavailable. Requires Hugging Face token and pyannote.audio.")
+                if not self.speaker_models.get('embedding'):
+                    self.logger.error("Embedding model unavailable. Requires Hugging Face token and pyannote.audio.")
+                return None
+            
+            # Preprocess audio
+            waveform, sample_rate = self.preprocess_audio_for_speaker(file_path)
+            if waveform is None:
+                return None
+            
+            # Create audio dict for pyannote
+            audio_dict = {"waveform": waveform, "sample_rate": sample_rate}
+            
+            with self._model_lock:
+                # Get diarization results
+                diarization = self.speaker_models['diarization'](audio_dict)
+                
+                # Collect embeddings per speaker
+                speaker_embeddings = {}
+                timeline_data = []
+                
+                for turn, _, speaker in diarization.itertracks(yield_label=True):
+                    duration = turn.end - turn.start
+                    if duration < 1.0:  # Skip segments shorter than 1 second
+                        continue
+                    
+                    # Store timeline information
+                    timeline_data.append({
+                        'start': round(turn.start, 2),
+                        'end': round(turn.end, 2),
+                        'duration': round(duration, 2),
+                        'local_speaker': speaker
+                    })
+                    
+                    try:
+                        # Extract segment for embedding
+                        start_sample = int(turn.start * sample_rate)
+                        end_sample = int(turn.end * sample_rate)
+                        segment_waveform = waveform[:, start_sample:end_sample]
+                        
+                        segment_audio = {"waveform": segment_waveform, "sample_rate": sample_rate}
+                        segment_embedding = self.speaker_models['embedding'](segment_audio)
+                        
+                        if segment_embedding is not None and segment_embedding.size > 0:
+                            if speaker not in speaker_embeddings:
+                                speaker_embeddings[speaker] = []
+                            speaker_embeddings[speaker].append(segment_embedding)
+                            
+                    except Exception as e:
+                        self.logger.warning(f"Error processing segment for speaker {speaker}: {e}")
+                        continue
+            
+            # Average embeddings per speaker
+            file_embeddings = []
+            local_speakers = []
+            
+            for local_speaker, embeddings in speaker_embeddings.items():
+                if len(embeddings) > 0:
+                    try:
+                        mean_embedding = np.mean(np.vstack(embeddings), axis=0)
+                        file_embeddings.append(mean_embedding.tolist())  # Convert to list for JSON
+                        local_speakers.append(local_speaker)
+                    except Exception as e:
+                        self.logger.warning(f"Error averaging embeddings for speaker {local_speaker}: {e}")
+                        continue
+            
+            if not file_embeddings:
+                self.logger.warning(f"No valid embeddings extracted from {filename}")
+                return None
+            
+            # Create result
+            result = {
+                "filename": filename,
+                "embeddings": file_embeddings,
+                "local_speakers": local_speakers,
+                "timeline": timeline_data,
+                "embedding_count": len(file_embeddings)
+            }
+            
+            self.logger.info(f"Successfully extracted {len(file_embeddings)} embeddings from {filename}")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error processing speaker embeddings: {e}")
+            return None
             
     def _check_cuda(self) -> bool:
         """Check if CUDA is available"""
@@ -89,7 +281,8 @@ class WorkerClient:
                 f"{self.server_url}/api/workers/register",
                 json={
                     "worker_id": self.worker_id,
-                    "name": self.worker_name
+                    "name": self.worker_name,
+                    "mode": self.mode
                 },
                 timeout=10
             )
@@ -97,7 +290,7 @@ class WorkerClient:
             if response.status_code == 200:
                 result = response.json()
                 if result.get("success"):
-                    self.logger.info(f"Successfully registered worker {self.worker_id}")
+                    self.logger.info(f"Successfully registered worker {self.worker_id} in {self.mode} mode")
                     return True
                 else:
                     self.logger.error(f"Registration failed: {result.get('message')}")
@@ -179,18 +372,30 @@ class WorkerClient:
                     try:
                         # Download the file
                         if self.download_file(file_path, temp_path):
-                            # Process the audio file
-                            result = self.process_audio_file(temp_path, filename)
+                            # Process based on task type
+                            task_type = task.get("task_type", "transcription")
                             
-                            if result and self.is_coherent_transcript(result.get("transcript", "")):
-                                # Submit successful result
-                                self.submit_result(task_id, True, result)
+                            if task_type == "speaker_embedding":
+                                # Process for speaker embeddings
+                                result = self.process_speaker_embeddings(temp_path, filename)
+                                if result:
+                                    self.submit_embedding_result(task_id, True, result)
+                                else:
+                                    self.submit_embedding_result(task_id, False, error_message="Failed to extract embeddings")
                             else:
-                                # No meaningful or incoherent transcript found
-                                self.submit_result(task_id, True, None)
+                                # Process for transcription (original behavior)
+                                result = self.process_audio_file(temp_path, filename)
+                                if result and self.is_coherent_transcript(result.get("transcript", "")):
+                                    self.submit_result(task_id, True, result)
+                                else:
+                                    self.submit_result(task_id, True, None)
                         else:
                             # Download failed
-                            self.submit_result(task_id, False, error_message="Failed to download file")
+                            task_type = task.get("task_type", "transcription")
+                            if task_type == "speaker_embedding":
+                                self.submit_embedding_result(task_id, False, error_message="Failed to download file")
+                            else:
+                                self.submit_result(task_id, False, error_message="Failed to download file")
                     
                     finally:
                         # Clean up temporary file
@@ -216,8 +421,13 @@ class WorkerClient:
     def get_task(self) -> Optional[Dict]:
         """Get a task from the server"""
         try:
+            # Request tasks based on worker mode
+            endpoint = "/api/workers/get-task"
+            if self.mode == "embedding":
+                endpoint = "/api/tasks/embedding/get"
+                
             response = requests.post(
-                f"{self.server_url}/api/workers/get-task",
+                f"{self.server_url}{endpoint}",
                 json={"worker_id": self.worker_id},
                 timeout=10
             )
@@ -497,13 +707,60 @@ class WorkerClient:
             self.logger.error(f"Error submitting result: {e}")
             return False
             
+    def submit_embedding_result(self, task_id: int, success: bool, result: Optional[Dict] = None, error_message: Optional[str] = None) -> bool:
+        """Submit speaker embedding task result to server"""
+        try:
+            payload = {
+                "task_id": task_id,
+                "worker_id": self.worker_id,
+                "success": success
+            }
+            
+            if success and result:
+                payload["embedding_data"] = result
+            elif not success and error_message:
+                payload["error_message"] = error_message
+            
+            response = requests.post(
+                f"{self.server_url}/api/tasks/embedding/submit",
+                json=payload,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                server_result = response.json()
+                if server_result.get("success"):
+                    self.logger.info(f"Successfully submitted embedding result for task {task_id}")
+                    return True
+                else:
+                    self.logger.error(f"Failed to submit embedding result: {server_result.get('message')}")
+                    return False
+            else:
+                self.logger.error(f"Failed to submit embedding result with status {response.status_code}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error submitting embedding result: {e}")
+            return False
+            
     def run(self):
         """Main worker loop using producer-consumer pattern"""
-        self.logger.info(f"Starting WhisperWatch worker {self.worker_id}")
+        self.logger.info(f"Starting WhisperWatch worker {self.worker_id} in {self.mode} mode")
         
-        # Initialize Whisper model
-        if not self.initialize_whisper():
-            self.logger.error("Failed to initialize Whisper model, exiting")
+        # Initialize appropriate models based on mode
+        if self.mode == "transcription":
+            if not self.initialize_whisper():
+                self.logger.error("Failed to initialize Whisper model, exiting")
+                return 1
+        elif self.mode == "embedding":
+            if not HAS_SPEAKER_DEPS:
+                self.logger.error("Speaker processing dependencies not available for embedding mode")
+                return 1
+            if not self.initialize_speaker_models():
+                self.logger.error("Failed to initialize speaker models, exiting")
+                return 1
+        else:
+            self.logger.error(f"Unknown mode: {self.mode}")
             return 1
             
         # Register with server
@@ -567,6 +824,9 @@ def main():
     parser.add_argument("--password", required=True, help="Password for authentication")
     parser.add_argument("--worker-name", required=True, help="Worker ID/name")
     parser.add_argument("--max-concurrent", type=int, default=4, help="Max concurrent tasks (1-10, default: 4)")
+    parser.add_argument("--mode", choices=["transcription", "embedding"], default="transcription", 
+                       help="Worker mode: transcription (Whisper) or embedding (Speaker ID)")
+    parser.add_argument("--hf-token", help="Hugging Face token for pyannote models (overrides HUGGINGFACE_TOKEN env)")
 
     args = parser.parse_args()
 
@@ -579,7 +839,9 @@ def main():
         args.worker_name,
         args.max_concurrent,
         args.username,
-        args.password
+        args.password,
+        args.mode,
+        args.hf_token
     )
     return worker.run()
 
