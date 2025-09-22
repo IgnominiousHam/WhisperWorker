@@ -18,10 +18,7 @@ from faster_whisper import WhisperModel
 import argparse
 import re
 import numpy as np
-from dotenv import load_dotenv
 
-# Load environment variables from .env if present
-load_dotenv()
 
 # Try to import speaker processing dependencies
 try:
@@ -50,7 +47,7 @@ class WorkerClient:
         self.username = username
         self.password = password
         # Prefer explicit token, else environment
-        self.hf_token = hf_token or os.getenv("HUGGINGFACE_TOKEN")
+        self.hf_token = hf_token
 
         # Setup logging
         logging.basicConfig(
