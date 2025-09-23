@@ -378,7 +378,7 @@ class WorkerClient:
                                 if result:
                                     self.submit_embedding_result(task_id, True, result)
                                 else:
-                                    self.submit_embedding_result(task_id, True, error_message="No embeds detected")
+                                    self.submit_embedding_result(task_id, False, error_message="No embeds detected")
                             else:
                                 # Process for transcription (original behavior)
                                 result = self.process_audio_file(temp_path, filename)
@@ -713,9 +713,9 @@ class WorkerClient:
                 "success": success
             }
             
-            if success and result:
+            if result:
                 payload["embedding_data"] = result
-            elif not success and error_message:
+            if error_message:
                 payload["error_message"] = error_message
             
             response = requests.post(
