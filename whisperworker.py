@@ -19,35 +19,26 @@ import argparse
 import re
 import numpy as np
 
-
-# Try to import speaker processing dependencies
-try:
-    import torch
-    import torchaudio
-    from pyannote.audio import Pipeline, Model, Inference
-    from sklearn.preprocessing import normalize
-    HAS_SPEAKER_DEPS = True
-except ImportError:
-    HAS_SPEAKER_DEPS = False
-
 class WorkerClient:
-    def __init__(self, server_url: str, worker_name: str, max_concurrent: int = 4, username: str = None, password: str = None, mode: str = "transcription", hf_token: Optional[str] = None):
+    def __init__(self, server_url: str, worker_name: str, max_concurrent: int = 4, username: str = None, password: str = None):
         self.server_url = server_url.rstrip('/')
         self.worker_name = worker_name
         self.worker_id = nanoid.generate(size=10)
         self.max_concurrent = max_concurrent  # Maximum concurrent downloads/processing
-        self.mode = mode  # "transcription" or "embedding"
+        self.mode = "transcription"
         self.running = False
         self.whisper_model = None
-        self.speaker_models = {}  # For speaker embedding models
         self._model_lock = threading.Lock()  # Protect model access
         self._task_queue = queue.Queue(maxsize=self.max_concurrent * 2)  # Buffer for tasks
         self._active_workers = 0
         self._workers_lock = threading.Lock()
         self.username = username
         self.password = password
-        # Prefer explicit token, else environment
-        self.hf_token = hf_token
+        # Optional secret for worker-authenticated endpoints (env overrideable)
+        self.worker_secret = os.getenv('WORKER_SECRET') or None
+        # PostgreSQL notification listener flags
+        self.listening_for_tasks = False
+        self.notification_conn = None
 
         # Setup logging
         logging.basicConfig(
@@ -90,178 +81,65 @@ class WorkerClient:
             self.logger.error(f"Failed to initialize Whisper model: {e}")
             return False
 
-    def initialize_speaker_models(self):
-        """Initialize speaker embedding models"""
-        if not HAS_SPEAKER_DEPS:
-            self.logger.error("Speaker processing dependencies not available")
-            return False
-            
+    def start_task_notification_listener(self):
+        """Listen on PostgreSQL NOTIFY channel 'new_task' and queue tasks quickly (optional)."""
         try:
-            self.logger.info("Initializing speaker embedding models...")
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.logger.info(f"Using device: {device}")
-            if not self.hf_token:
-                self.logger.warning("HUGGINGFACE_TOKEN not set. pyannote models require an access token. Provide via .env or --hf-token.")
-            
-            # Initialize diarization pipeline
-            try:
-                # Try latest stable first
-                self.speaker_models['diarization'] = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization",
-                    use_auth_token=self.hf_token
-                )
-                self.logger.info("Diarization pipeline initialized (pyannote/speaker-diarization)")
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize diarization pipeline 'pyannote/speaker-diarization': {e}")
-                # Fallback to a specific version
-                try:
-                    self.speaker_models['diarization'] = Pipeline.from_pretrained(
-                        "pyannote/speaker-diarization-3.1",
-                        use_auth_token=self.hf_token
-                    )
-                    self.logger.info("Diarization pipeline initialized (pyannote/speaker-diarization-3.1)")
-                except Exception as e2:
-                    self.logger.warning(f"Failed fallback diarization pipeline 'pyannote/speaker-diarization-3.1': {e2}")
-                    self.speaker_models['diarization'] = None
-            
-            # Initialize embedding model
-            try:
-                embedding_model = Model.from_pretrained(
-                    "pyannote/embedding", 
-                    use_auth_token=self.hf_token
-                )
-                self.speaker_models['embedding'] = Inference(embedding_model, window="whole")
-                self.logger.info("Embedding model initialized (pyannote/embedding)")
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize embedding model: {e}")
-                self.speaker_models['embedding'] = None
-            
-            if not any(self.speaker_models.values()):
-                self.logger.error("No speaker models could be initialized. Ensure pyannote.audio deps are installed and HUGGINGFACE_TOKEN is valid.")
-                return False
-                
-            self.logger.info("Speaker models initialized successfully")
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to initialize speaker models: {e}")
-            return False
-            
-    def preprocess_audio_for_speaker(self, audio_path, target_sample_rate=16000):
-        """Load and preprocess audio for speaker processing"""
-        try:
-            waveform, sample_rate = torchaudio.load(audio_path)
-            
-            # Convert to mono if stereo
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-            
-            # Resample to target sample rate if needed
-            if sample_rate != target_sample_rate:
-                resampler = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate, 
-                    new_freq=target_sample_rate
-                )
-                waveform = resampler(waveform)
-            
-            return waveform, target_sample_rate
-        except Exception as e:
-            self.logger.error(f"Error preprocessing audio: {e}")
-            return None, None
+            import psycopg2
+            import psycopg2.extensions
+            import json
+            import select
 
-    def process_speaker_embeddings(self, file_path: str, filename: str) -> Optional[Dict]:
-        """Process audio file for speaker embeddings"""
-        try:
-            self.logger.info(f"Processing speaker embeddings for: {filename}")
-            
-            if not self.speaker_models.get('diarization') or not self.speaker_models.get('embedding'):
-                self.logger.error("Speaker models not properly initialized")
-                if not self.speaker_models.get('diarization'):
-                    self.logger.error("Diarization pipeline unavailable. Requires Hugging Face token and pyannote.audio.")
-                if not self.speaker_models.get('embedding'):
-                    self.logger.error("Embedding model unavailable. Requires Hugging Face token and pyannote.audio.")
-                return None
-            
-            # Preprocess audio
-            waveform, sample_rate = self.preprocess_audio_for_speaker(file_path)
-            if waveform is None:
-                return None
-            
-            # Create audio dict for pyannote
-            audio_dict = {"waveform": waveform, "sample_rate": sample_rate}
-            
-            with self._model_lock:
-                # Get diarization results
-                diarization = self.speaker_models['diarization'](audio_dict)
-                
-                # Collect embeddings per speaker
-                speaker_embeddings = {}
-                timeline_data = []
-                
-                for turn, _, speaker in diarization.itertracks(yield_label=True):
-                    duration = turn.end - turn.start
-                    if duration < 1.0:  # Skip segments shorter than 1 second
-                        continue
-                    
-                    # Store timeline information
-                    timeline_data.append({
-                        'start': round(turn.start, 2),
-                        'end': round(turn.end, 2),
-                        'duration': round(duration, 2),
-                        'local_speaker': speaker
-                    })
-                    
-                    try:
-                        # Extract segment for embedding
-                        start_sample = int(turn.start * sample_rate)
-                        end_sample = int(turn.end * sample_rate)
-                        segment_waveform = waveform[:, start_sample:end_sample]
-                        
-                        segment_audio = {"waveform": segment_waveform, "sample_rate": sample_rate}
-                        segment_embedding = self.speaker_models['embedding'](segment_audio)
-                        
-                        if segment_embedding is not None and segment_embedding.size > 0:
-                            if speaker not in speaker_embeddings:
-                                speaker_embeddings[speaker] = []
-                            speaker_embeddings[speaker].append(segment_embedding)
-                            
-                    except Exception as e:
-                        self.logger.warning(f"Error processing segment for speaker {speaker}: {e}")
-                        continue
-            
-            # Average embeddings per speaker
-            file_embeddings = []
-            local_speakers = []
-            
-            for local_speaker, embeddings in speaker_embeddings.items():
-                if len(embeddings) > 0:
-                    try:
-                        mean_embedding = np.mean(np.vstack(embeddings), axis=0)
-                        file_embeddings.append(mean_embedding.tolist())  # Convert to list for JSON
-                        local_speakers.append(local_speaker)
-                    except Exception as e:
-                        self.logger.warning(f"Error averaging embeddings for speaker {local_speaker}: {e}")
-                        continue
-            
-            if not file_embeddings:
-                self.logger.warning(f"No valid embeddings extracted from {filename}")
-                return None
-            
-            # Create result
-            result = {
-                "filename": filename,
-                "embeddings": file_embeddings,
-                "local_speakers": local_speakers,
-                "timeline": timeline_data,
-                "embedding_count": len(file_embeddings)
+            db_config = {
+                'host': os.getenv('POSTGRES_HOST', 'localhost'),
+                'port': int(os.getenv('POSTGRES_PORT', 5432)),
+                'database': os.getenv('POSTGRES_DATABASE', 'whisperwatch'),
+                'user': os.getenv('POSTGRES_USER', 'whisperwatch_user'),
+                'password': os.getenv('POSTGRES_PASSWORD', 'testpassword'),
             }
-            
-            self.logger.info(f"Successfully extracted {len(file_embeddings)} embeddings from {filename}")
-            return result
-            
+
+            self.notification_conn = psycopg2.connect(**db_config)
+            self.notification_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+            cur = self.notification_conn.cursor()
+            cur.execute("LISTEN new_task")
+            self.listening_for_tasks = True
+            self.logger.info("Listening for PostgreSQL task notifications on channel 'new_task'")
+
+            while self.running and self.listening_for_tasks:
+                # Wait using select on the connection
+                if select.select([self.notification_conn], [], [], 1) == ([], [], []):
+                    continue
+                self.notification_conn.poll()
+                while self.notification_conn.notifies:
+                    notify = self.notification_conn.notifies.pop(0)
+                    try:
+                        _ = json.loads(notify.payload)
+                    except Exception:
+                        pass
+                    # Try to fetch and queue a task
+                    self.try_get_and_queue_task()
         except Exception as e:
-            self.logger.error(f"Error processing speaker embeddings: {e}")
-            return None
+            self.logger.warning(f"Task notification listener stopped: {e}")
+        finally:
+            self.listening_for_tasks = False
+            try:
+                if self.notification_conn:
+                    self.notification_conn.close()
+            except Exception:
+                pass
+
+    def try_get_and_queue_task(self):
+        try:
+            if not self._task_queue.full():
+                task = self.get_task()
+                if task:
+                    try:
+                        self._task_queue.put_nowait(task)
+                    except queue.Full:
+                        pass
+        except Exception as e:
+            self.logger.debug(f"Notification-triggered fetch failed: {e}")
+
+    # Speaker ID functionality removed per project requirements
             
     def _check_cuda(self) -> bool:
         """Check if CUDA is available"""
@@ -279,7 +157,8 @@ class WorkerClient:
                 json={
                     "worker_id": self.worker_id,
                     "name": self.worker_name,
-                    "mode": self.mode
+                    "mode": self.mode,
+                    "secret": self.worker_secret,
                 },
                 timeout=10
             )
@@ -329,7 +208,8 @@ class WorkerClient:
                     task = self.get_task()
                     if task:
                         self._task_queue.put(task, timeout=1)
-                        self.logger.debug(f"Added task {task['id']} to queue")
+                        label = task.get('id') or task.get('filename') or 'unknown'
+                        self.logger.debug(f"Added task {label} to queue")
                     else:
                         # No tasks available, wait a bit before trying again
                         time.sleep(2)
@@ -354,12 +234,14 @@ class WorkerClient:
                     self._active_workers += 1
                 
                 try:
-                    self.logger.info(f"Worker processing task {task['id']}: {task['filename']}")
-                    
-                    # Download the file
-                    task_id = task["id"]
-                    file_path = task["file_path"]
-                    filename = task["filename"]
+                    label = task.get('id') or task.get('filename') or 'unknown'
+                    filename = task.get("filename")
+                    task_id = task.get("id")
+                    file_path = task.get("file_path")
+                    if not file_path and filename:
+                        # Construct a path for legacy download fallback if needed
+                        file_path = os.path.join(os.getenv('AUDIO_FOLDER', 'audio'), filename)
+                    self.logger.info(f"Worker processing task {label}: {filename}")
                     
                     # Create temporary file for download
                     temp_file = tempfile.NamedTemporaryFile(suffix=Path(filename).suffix, delete=False)
@@ -368,31 +250,39 @@ class WorkerClient:
                     
                     try:
                         # Download the file
-                        if self.download_file(file_path, temp_path):
+                        if self.download_file(file_path or filename, temp_path, filename_hint=filename):
                             # Process based on task type
-                            task_type = task.get("task_type", "transcription")
-                            
-                            if task_type == "speaker_embedding":
-                                # Process for speaker embeddings
-                                result = self.process_speaker_embeddings(temp_path, filename)
-                                if result:
-                                    self.submit_embedding_result(task_id, True, result)
-                                else:
-                                    self.submit_embedding_result(task_id, False, error_message="No embeds detected")
-                            else:
-                                # Process for transcription (original behavior)
-                                result = self.process_audio_file(temp_path, filename)
-                                if result and self.is_coherent_transcript(result.get("transcript", "")):
+                            # Transcription only
+                            result = self.process_audio_file(temp_path, filename)
+                            if result and self.is_coherent_transcript(result.get("transcript", "")):
+                                if task_id is not None:
                                     self.submit_result(task_id, True, result)
                                 else:
-                                    self.submit_result(task_id, True, None)
+                                    self.submit_transcription_result_filename(filename, True, result)
+                            else:
+                                # If we processed the file but transcript isn't coherent, mark as complete with empty transcript.
+                                # If result is None (e.g., skipped/processing failed), record failure as before to allow retry logic.
+                                if result is not None:
+                                    empty_result = {
+                                        "transcript": "",
+                                        "language": result.get("language", ""),
+                                        "duration": result.get("duration", 0.0),
+                                    }
+                                    if task_id is not None:
+                                        self.submit_result(task_id, True, empty_result)
+                                    else:
+                                        self.submit_transcription_result_filename(filename, True, empty_result)
+                                else:
+                                    if task_id is not None:
+                                        self.submit_result(task_id, False, error_message="Processing failed or skipped")
+                                    else:
+                                        self.submit_transcription_result_filename(filename, False, error_message="Processing failed or skipped")
                         else:
                             # Download failed
-                            task_type = task.get("task_type", "transcription")
-                            if task_type == "speaker_embedding":
-                                self.submit_embedding_result(task_id, False, error_message="Failed to download file")
-                            else:
+                            if task_id is not None:
                                 self.submit_result(task_id, False, error_message="Failed to download file")
+                            else:
+                                self.submit_transcription_result_filename(filename, False, error_message="Failed to download file")
                     
                     finally:
                         # Clean up temporary file
@@ -418,21 +308,21 @@ class WorkerClient:
     def get_task(self) -> Optional[Dict]:
         """Get a task from the server"""
         try:
-            # Request tasks based on worker mode
             endpoint = "/api/workers/get-task"
-            if self.mode == "embedding":
-                endpoint = "/api/tasks/embedding/get"
-                
             response = requests.post(
                 f"{self.server_url}{endpoint}",
-                json={"worker_id": self.worker_id},
+                json={"worker_id": self.worker_id, "mode": self.mode},
                 timeout=10
             )
             
             if response.status_code == 200:
                 result = response.json()
                 if result.get("success") and result.get("task"):
-                    return result["task"]
+                    task = result["task"]
+                    # Normalize task shape as transcription-only
+                    if 'filename' in task and 'file_path' not in task:
+                        task.setdefault('task_type', 'transcription')
+                    return task
             else:
                 self.logger.debug(f"No tasks available (status: {response.status_code})")
                 
@@ -442,24 +332,45 @@ class WorkerClient:
             self.logger.error(f"Error getting task: {e}")
             return None
             
-    def download_file(self, file_path: str, local_path: str) -> bool:
-        """Download file from server"""
+    def download_file(self, file_path_or_filename: str, local_path: str, filename_hint: Optional[str] = None) -> bool:
+        """Download file, preferring worker-authenticated endpoint by filename; fallback to legacy /download."""
         try:
+            # Try worker endpoint by filename first
+            filename = filename_hint or os.path.basename(file_path_or_filename)
+            try:
+                headers = {}
+                if self.worker_id:
+                    headers['X-Worker-Id'] = str(self.worker_id)
+                if self.worker_secret:
+                    headers['X-Worker-Secret'] = str(self.worker_secret)
+                url = f"{self.server_url}/api/workers/audio/{filename}"
+                resp = requests.get(url, headers=headers, stream=True, timeout=60)
+                if resp.status_code == 200:
+                    with open(local_path, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    return True
+                else:
+                    self.logger.error(f"Worker audio endpoint 404/err for {filename}: status={resp.status_code}")
+            except Exception as e:
+                self.logger.debug(f"Worker audio endpoint failed, will fallback: {e}")
+
+            # Fallback to legacy /download with a file path
+            from urllib.parse import quote
+            quoted = quote(file_path_or_filename, safe='')
             response = requests.get(
-                f"{self.server_url}/download/{file_path}",
+                f"{self.server_url}/download/{quoted}",
                 stream=True,
                 timeout=60
             )
-            
             if response.status_code == 200:
                 with open(local_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
                 return True
             else:
-                self.logger.error(f"Failed to download file: {response.status_code}")
+                self.logger.error(f"Legacy download endpoint failed for {file_path_or_filename}: status={response.status_code}")
                 return False
-                
         except Exception as e:
             self.logger.error(f"Error downloading file: {e}")
             return False
@@ -624,28 +535,72 @@ class WorkerClient:
                 total_duration = max(total_duration, segment.end)
                 segment_count += 1
             
-            # Check if we have meaningful content
-            if segment_count == 0 or len(timestamped_transcript.strip()) < 10:
-                self.logger.info(f"No meaningful transcript found for {filename} - skipping database entry")
-                return None
-            
             # Extract file info
             frequency, modulation, box = self.extract_file_info(filename)
-            
             # Generate current DTG and UUID
             dtg = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             task_uuid = str(uuid.uuid4())
-            
-            # Language checks before returning transcription
+
+            # Check if we have meaningful content; if not, return an empty but successful transcription result
+            if segment_count == 0 or len(timestamped_transcript.strip()) < 10:
+                self.logger.info(f"No meaningful transcript found for {filename} - marking complete with empty transcript")
+                transcription = {
+                    "dtg": dtg,
+                    "frequency": frequency,
+                    "language": getattr(info, 'language', ''),
+                    "duration": total_duration,
+                    "transcript": "",
+                    "modulation": modulation,
+                    "box": box,
+                    "filename": filename,
+                    "uuid": task_uuid
+                }
+                return transcription
+
+            # Language checks AFTER deciding no-content completion
+            # If there is content but language confidence is low, mark complete with empty transcript
             if hasattr(info, 'language') and info.language == 'nn':
-                self.logger.info(f"Detected language 'nn', skipping DB and file append...")
-                return None
+                self.logger.info(f"Detected language 'nn' with content, marking complete with empty transcript")
+                transcription = {
+                    "dtg": dtg,
+                    "frequency": frequency,
+                    "language": getattr(info, 'language', ''),
+                    "duration": total_duration,
+                    "transcript": "",
+                    "modulation": modulation,
+                    "box": box,
+                    "filename": filename,
+                    "uuid": task_uuid
+                }
+                return transcription
             if hasattr(info, 'language') and info.language == 'ro':
-                self.logger.info(f"Detected language 'ro', skipping DB and file append...")
-                return None
+                self.logger.info(f"Detected language 'ro' with content, marking complete with empty transcript")
+                transcription = {
+                    "dtg": dtg,
+                    "frequency": frequency,
+                    "language": getattr(info, 'language', ''),
+                    "duration": total_duration,
+                    "transcript": "",
+                    "modulation": modulation,
+                    "box": box,
+                    "filename": filename,
+                    "uuid": task_uuid
+                }
+                return transcription
             if hasattr(info, 'language_probability') and info.language_probability < 0.5:
-                self.logger.info(f"Language confidence {getattr(info, 'language_probability', 0):.2f} < 0.5, skipping...")
-                return None
+                self.logger.info(f"Language confidence {getattr(info, 'language_probability', 0):.2f} < 0.5 with content, marking complete with empty transcript")
+                transcription = {
+                    "dtg": dtg,
+                    "frequency": frequency,
+                    "language": getattr(info, 'language', ''),
+                    "duration": total_duration,
+                    "transcript": "",
+                    "modulation": modulation,
+                    "box": box,
+                    "filename": filename,
+                    "uuid": task_uuid
+                }
+                return transcription
 
             # Build transcription result in database format
             transcription = {
@@ -704,60 +659,42 @@ class WorkerClient:
             self.logger.error(f"Error submitting result: {e}")
             return False
             
-    def submit_embedding_result(self, task_id: int, success: bool, result: Optional[Dict] = None, error_message: Optional[str] = None) -> bool:
-        """Submit speaker embedding task result to server"""
+
+    def submit_transcription_result_filename(self, filename: str, success: bool, result: Optional[Dict] = None, error_message: Optional[str] = None) -> bool:
+        """Submit transcription result using filename-based (Postgres) endpoint."""
         try:
             payload = {
-                "task_id": task_id,
+                "filename": filename,
                 "worker_id": self.worker_id,
-                "success": success
+                "success": success,
             }
-            
-            if result:
-                payload["embedding_data"] = result
-            if error_message:
+            if success:
+                # Accept empty/none result by providing defaults
+                result = result or {}
+                payload["transcript"] = result.get("transcript", "")
+                payload["language"] = result.get("language", "")
+                payload["duration"] = result.get("duration", 0.0)
+            elif not success and error_message:
                 payload["error_message"] = error_message
-            
-            response = requests.post(
-                f"{self.server_url}/api/tasks/embedding/submit",
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                server_result = response.json()
-                if server_result.get("success"):
-                    self.logger.info(f"Successfully submitted embedding result for task {task_id}")
-                    return True
-                else:
-                    self.logger.error(f"Failed to submit embedding result: {server_result.get('message')}")
-                    return False
-            else:
-                self.logger.error(f"Failed to submit embedding result with status {response.status_code}")
-                return False
-                
-        except Exception as e:
-            self.logger.error(f"Error submitting embedding result: {e}")
+            resp = requests.post(f"{self.server_url}/api/workers/submit-transcription", json=payload, timeout=30)
+            ok = (resp.status_code == 200 and resp.json().get('success'))
+            if ok:
+                self.logger.info(f"Submitted transcription (PG) for {filename} (success={success})")
+                return True
+            self.logger.error(f"Failed to submit transcription (PG) for {filename}: {resp.status_code} {resp.text}")
             return False
+        except Exception as e:
+            self.logger.error(f"Error submitting transcription (PG): {e}")
+            return False
+
             
     def run(self):
-        """Main worker loop using producer-consumer pattern"""
+        """Main worker loop using producer-consumer pattern + Postgres notifications when available."""
         self.logger.info(f"Starting WhisperWatch worker {self.worker_id} in {self.mode} mode")
         
-        # Initialize appropriate models based on mode
-        if self.mode == "transcription":
-            if not self.initialize_whisper():
-                self.logger.error("Failed to initialize Whisper model, exiting")
-                return 1
-        elif self.mode == "embedding":
-            if not HAS_SPEAKER_DEPS:
-                self.logger.error("Speaker processing dependencies not available for embedding mode")
-                return 1
-            if not self.initialize_speaker_models():
-                self.logger.error("Failed to initialize speaker models, exiting")
-                return 1
-        else:
-            self.logger.error(f"Unknown mode: {self.mode}")
+        # Initialize Whisper model (transcription-only)
+        if not self.initialize_whisper():
+            self.logger.error("Failed to initialize Whisper model, exiting")
             return 1
             
         # Register with server
@@ -770,10 +707,14 @@ class WorkerClient:
         
         self.logger.info(f"Worker is now running with {self.max_concurrent} concurrent task processors")
         
-        # Start task producer thread
+        # Start task producer thread (HTTP polling fallback)
         producer_thread = threading.Thread(target=self.task_producer, daemon=True)
         producer_thread.start()
         
+        # Start Postgres LISTEN/NOTIFY task listener if DB env is present
+        if os.getenv('POSTGRES_HOST'):
+            threading.Thread(target=self.start_task_notification_listener, daemon=True).start()
+
         # Start worker threads
         worker_threads = []
         for i in range(self.max_concurrent):
@@ -821,9 +762,8 @@ def main():
     parser.add_argument("--password", required=True, help="Password for authentication")
     parser.add_argument("--worker-name", required=True, help="Worker ID/name")
     parser.add_argument("--max-concurrent", type=int, default=4, help="Max concurrent tasks (1-10, default: 4)")
-    parser.add_argument("--mode", choices=["transcription", "embedding"], default="transcription", 
-                       help="Worker mode: transcription (Whisper) or embedding (Speaker ID)")
-    parser.add_argument("--hf-token", help="Hugging Face token for pyannote models (overrides HUGGINGFACE_TOKEN env)")
+    # Speaker ID functionality removed; worker runs in transcription-only mode
+    # parser.add_argument("--worker-secret", help="Optional worker secret to authenticate /api/workers/audio downloads")
 
     args = parser.parse_args()
 
@@ -837,9 +777,8 @@ def main():
         args.max_concurrent,
         args.username,
         args.password,
-        args.mode,
-        args.hf_token
     )
+
     return worker.run()
 
 
