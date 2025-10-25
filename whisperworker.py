@@ -88,6 +88,15 @@ class WorkerClient:
         """Initialize the EasyNMT translation model"""
         try:
             self.logger.info("Initializing EasyNMT translation model...")
+            
+            # Download required NLTK data if not already present
+            try:
+                import nltk
+                nltk.download('punkt_tab', quiet=True)
+                self.logger.debug("NLTK punkt_tab data downloaded/verified")
+            except Exception as e:
+                self.logger.warning(f"Failed to download NLTK data (translation may still work): {e}")
+            
             # Use a lightweight model suitable for general translation
             # Options: 'opus-mt', 'mbart50_m2m', 'm2m_100_418M', 'm2m_100_1.2B'
             self.translation_model = EasyNMT('opus-mt')
