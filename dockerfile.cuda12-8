@@ -1,0 +1,17 @@
+FROM lscr.io/linuxserver/faster-whisper:gpu
+WORKDIR /app
+ENV WHISPER_MODEL=small-float16
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh || true
+RUN mkdir -p /usr/local/cuda/lib64 && \
+    ln -sf /lsiopy/lib/python3.12/site-packages/ctranslate2.libs/libcudnn-463fd6d5.so.8.9.7 /usr/local/cuda/lib64/libcudnn.so.8.9.7 && \
+    ln -sf /usr/local/cuda/lib64/libcudnn.so.8.9.7 /usr/local/cuda/lib64/libcudnn.so.8 && \
+    ln -sf /usr/local/cuda/lib64/libcudnn.so.8.9.7 /usr/local/cuda/lib64/libcudnn_ops_infer.so.8 && \
+    ln -sf /usr/local/cuda/lib64/libcudnn.so.8.9.7 /usr/local/cuda/lib64/libcudnn_cnn.so.8 && \
+    ldconfig
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD []

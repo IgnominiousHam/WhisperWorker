@@ -18,6 +18,7 @@ from faster_whisper import WhisperModel
 import argparse
 import re
 import numpy as np
+from easynmt import EasyNMT
 
 class WorkerClient:
     def __init__(self, server_url: str, worker_name: str, max_concurrent: int = 4, username: str = None, password: str = None):
@@ -28,7 +29,9 @@ class WorkerClient:
         self.mode = "transcription"
         self.running = False
         self.whisper_model = None
+        self.translation_model = None
         self._model_lock = threading.Lock()  # Protect model access
+        self._translation_lock = threading.Lock()  # Protect translation model access
         self._task_queue = queue.Queue(maxsize=self.max_concurrent * 2)  # Buffer for tasks
         self._active_workers = 0
         self._workers_lock = threading.Lock()
@@ -66,7 +69,7 @@ class WorkerClient:
         try:
             self.logger.info("Initializing Whisper model...")
             # Try to use GPU if available
-            device = "cuda" if self._check_cuda() else "cpu"
+            device = "cuda"
             compute_type = "float16" if device == "cuda" else "int8"
             
             self.logger.info(f"Using device: {device}, compute_type: {compute_type}")
@@ -79,6 +82,20 @@ class WorkerClient:
             return True
         except Exception as e:
             self.logger.error(f"Failed to initialize Whisper model: {e}")
+            return False
+
+    def initialize_translation(self):
+        """Initialize the EasyNMT translation model"""
+        try:
+            self.logger.info("Initializing EasyNMT translation model...")
+            # Use a lightweight model suitable for general translation
+            # Options: 'opus-mt', 'mbart50_m2m', 'm2m_100_418M', 'm2m_100_1.2B'
+            self.translation_model = EasyNMT('opus-mt')
+            self.logger.info("EasyNMT translation model initialized successfully")
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to initialize EasyNMT model: {e}")
+            self.logger.warning("Translation will be disabled for this worker")
             return False
 
     def start_task_notification_listener(self):
@@ -394,6 +411,66 @@ class WorkerClient:
         seconds = int(seconds % 60)
         return f"{minutes:02d}:{seconds:02d}"
     
+    def translate_text(self, text: str, source_lang: str, target_lang: str = 'en') -> Optional[str]:
+        """Translate text from source language to target language using EasyNMT"""
+        if not self.translation_model:
+            self.logger.debug("Translation model not available, skipping translation")
+            return None
+        
+        # Don't translate if already in English
+        if source_lang == 'en' or source_lang == target_lang:
+            return None
+        
+        try:
+            self.logger.info(f"Translating text from {source_lang} to {target_lang}")
+            
+            # Use lock to ensure thread-safe access to translation model
+            with self._translation_lock:
+                # Split by lines to preserve timestamp structure
+                lines = text.strip().split('\n')
+                translated_lines = []
+                
+                for line in lines:
+                    if not line.strip():
+                        translated_lines.append(line)
+                        continue
+                    
+                    # Extract timestamp prefix if present
+                    timestamp_match = re.match(r'(\[\d{1,2}:\d{2}-\d{1,2}:\d{2}\]\s*)', line)
+                    if timestamp_match:
+                        timestamp_prefix = timestamp_match.group(1)
+                        text_to_translate = line[len(timestamp_prefix):]
+                    else:
+                        timestamp_prefix = ""
+                        text_to_translate = line
+                    
+                    # Skip empty lines
+                    if not text_to_translate.strip():
+                        translated_lines.append(line)
+                        continue
+                    
+                    # Translate the text (without timestamp)
+                    try:
+                        translated = self.translation_model.translate(
+                            text_to_translate,
+                            source_lang=source_lang,
+                            target_lang=target_lang
+                        )
+                        # Reconstruct line with timestamp
+                        translated_lines.append(timestamp_prefix + translated)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to translate line, keeping original: {e}")
+                        translated_lines.append(line)
+                
+                translated_text = '\n'.join(translated_lines)
+                self.logger.info(f"Successfully translated text from {source_lang} to {target_lang}")
+                return translated_text
+                
+        except Exception as e:
+            self.logger.error(f"Error during translation: {e}")
+            self.logger.error(traceback.format_exc())
+            return None
+    
 
     def is_coherent_transcript(self, text):
         """Return True if transcript is coherent (not blank, not repetitive, not gibberish, not just Unicode blocks, not sound effects)."""
@@ -550,6 +627,7 @@ class WorkerClient:
                     "language": getattr(info, 'language', ''),
                     "duration": total_duration,
                     "transcript": "",
+                    "transcript_original": "",
                     "modulation": modulation,
                     "box": box,
                     "filename": filename,
@@ -567,6 +645,7 @@ class WorkerClient:
                     "language": getattr(info, 'language', ''),
                     "duration": total_duration,
                     "transcript": "",
+                    "transcript_original": "",
                     "modulation": modulation,
                     "box": box,
                     "filename": filename,
@@ -581,6 +660,7 @@ class WorkerClient:
                     "language": getattr(info, 'language', ''),
                     "duration": total_duration,
                     "transcript": "",
+                    "transcript_original": "",
                     "modulation": modulation,
                     "box": box,
                     "filename": filename,
@@ -595,6 +675,7 @@ class WorkerClient:
                     "language": getattr(info, 'language', ''),
                     "duration": total_duration,
                     "transcript": "",
+                    "transcript_original": "",
                     "modulation": modulation,
                     "box": box,
                     "filename": filename,
@@ -602,20 +683,27 @@ class WorkerClient:
                 }
                 return transcription
 
+            # Translate if not in English
+            translated_transcript = None
+            if info.language != 'en':
+                self.logger.info(f"Detected non-English language '{info.language}', attempting translation")
+                translated_transcript = self.translate_text(timestamped_transcript.strip(), info.language, 'en')
+            
             # Build transcription result in database format
             transcription = {
                 "dtg": dtg,
                 "frequency": frequency,
                 "language": info.language,
                 "duration": total_duration,
-                "transcript": timestamped_transcript.strip(),
+                "transcript": translated_transcript if translated_transcript else timestamped_transcript.strip(),
+                "transcript_original": timestamped_transcript.strip() if translated_transcript else None,
                 "modulation": modulation,
                 "box": box,
                 "filename": filename,
                 "uuid": task_uuid
             }
 
-            self.logger.info(f"Successfully transcribed {filename} ({info.language}, {total_duration:.2f}s, {segment_count} segments)")
+            self.logger.info(f"Successfully transcribed {filename} ({info.language}, {total_duration:.2f}s, {segment_count} segments{', translated to English' if translated_transcript else ''})")
             return transcription
             
         except Exception as e:
@@ -672,6 +760,7 @@ class WorkerClient:
                 # Accept empty/none result by providing defaults
                 result = result or {}
                 payload["transcript"] = result.get("transcript", "")
+                payload["transcript_original"] = result.get("transcript_original", None)
                 payload["language"] = result.get("language", "")
                 payload["duration"] = result.get("duration", 0.0)
             elif not success and error_message:
@@ -696,6 +785,9 @@ class WorkerClient:
         if not self.initialize_whisper():
             self.logger.error("Failed to initialize Whisper model, exiting")
             return 1
+        
+        # Initialize translation model (optional, worker continues if this fails)
+        self.initialize_translation()
             
         # Register with server
         if not self.register_worker():
