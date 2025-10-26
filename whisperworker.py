@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Optional
 import uuid
 import requests
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 import argparse
 import re
 import numpy as np
@@ -65,20 +65,30 @@ class WorkerClient:
         self.running = False
         
     def initialize_whisper(self):
-        """Initialize the Whisper model"""
+        """Initialize the Whisper model with batched inference"""
         try:
-            self.logger.info("Initializing Whisper model...")
+            self.logger.info("Initializing Whisper model with batched inference...")
             # Try to use GPU if available
             device = "cuda"
             compute_type = "float16" if device == "cuda" else "int8"
             
-            self.logger.info(f"Using device: {device}, compute_type: {compute_type}")
-            self.whisper_model = WhisperModel(
+            # Read batch size from environment (default 16)
+            batch_size = int(os.getenv('WHISPER_BATCH_SIZE', '16'))
+            
+            self.logger.info(f"Using device: {device}, compute_type: {compute_type}, batch_size: {batch_size}")
+            
+            # Initialize base model
+            base_model = WhisperModel(
                 "small",  # You can make this configurable
                 device=device,
                 compute_type=compute_type
             )
-            self.logger.info("Whisper model initialized successfully")
+            
+            # Wrap with batched inference pipeline
+            self.whisper_model = BatchedInferencePipeline(model=base_model)
+            self.whisper_batch_size = batch_size
+            
+            self.logger.info("Whisper model with batched inference initialized successfully")
             return True
         except Exception as e:
             self.logger.error(f"Failed to initialize Whisper model: {e}")
@@ -591,9 +601,10 @@ class WorkerClient:
             
             # Use lock to ensure thread-safe access to Whisper model
             with self._model_lock:
-                # Transcribe the audio file
+                # Transcribe the audio file with batched inference
                 segments, info = self.whisper_model.transcribe(
                     file_path,
+                    batch_size=self.whisper_batch_size,
                     beam_size=5,
                     language=None  # Auto-detect language
                 )
@@ -863,6 +874,7 @@ def main():
     parser.add_argument("--password", required=True, help="Password for authentication")
     parser.add_argument("--worker-name", required=True, help="Worker ID/name")
     parser.add_argument("--max-concurrent", type=int, default=4, help="Max concurrent tasks (1-10, default: 4)")
+    parser.add_argument("--whisper-batch-size", type=int, default=16, help="Batch size for Whisper model (default: 16)")
     # Speaker ID functionality removed; worker runs in transcription-only mode
     # parser.add_argument("--worker-secret", help="Optional worker secret to authenticate /api/workers/audio downloads")
 
