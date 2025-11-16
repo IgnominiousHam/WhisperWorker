@@ -3,6 +3,7 @@ import logging
 import os
 import queue
 import signal
+import socket
 import sys
 import tempfile
 import threading
@@ -14,14 +15,38 @@ from pathlib import Path
 from typing import Dict, Optional
 import uuid
 import requests
+
+# Check internet connectivity early and set offline mode if needed
+def _early_internet_check() -> bool:
+    """Quick connectivity check before importing heavy libraries"""
+    test_hosts = [
+        ("huggingface.co", 443),
+        ("8.8.8.8", 53),
+    ]
+    for host, port in test_hosts:
+        try:
+            socket.setdefaulttimeout(2)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((host, port))
+            sock.close()
+            return True
+        except (socket.error, socket.timeout, socket.gaierror):
+            continue
+    return False
+
+# Set HuggingFace offline mode early if no internet
+if not _early_internet_check():
+    os.environ['HF_HUB_OFFLINE'] = '1'
+    os.environ['TRANSFORMERS_OFFLINE'] = '1'
+    os.environ['HF_DATASETS_OFFLINE'] = '1'
+
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 import argparse
 import re
-import numpy as np
 from easynmt import EasyNMT
 
 class WorkerClient:
-    def __init__(self, server_url: str, worker_name: str, max_concurrent: int = 4, username: str = None, password: str = None):
+    def __init__(self, server_url: str, worker_name: str, max_concurrent: int = 4, username: str = None, password: str = None, whisper_batch_size: int = 8):
         self.server_url = server_url.rstrip('/')
         self.worker_name = worker_name
         self.worker_id = nanoid.generate(size=10)
@@ -39,9 +64,12 @@ class WorkerClient:
         self.password = password
         # Optional secret for worker-authenticated endpoints (env overrideable)
         self.worker_secret = os.getenv('WORKER_SECRET') or None
+        self.whisper_batch_size = whisper_batch_size
         # PostgreSQL notification listener flags
         self.listening_for_tasks = False
         self.notification_conn = None
+        # Cache internet connectivity status
+        self._internet_available = None
 
         # Setup logging
         logging.basicConfig(
@@ -63,29 +91,67 @@ class WorkerClient:
         """Handle shutdown signals gracefully"""
         self.logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
+    
+    def _check_internet_connectivity(self) -> bool:
+        """Check if internet is available by attempting to connect to common hosts"""
+        if self._internet_available is not None:
+            return self._internet_available
+        
+        # Test connectivity to multiple reliable hosts
+        test_hosts = [
+            ("huggingface.co", 443),  # Primary: HuggingFace (needed for model downloads)
+            ("8.8.8.8", 53),           # Google DNS
+            ("1.1.1.1", 53),           # Cloudflare DNS
+        ]
+        
+        for host, port in test_hosts:
+            try:
+                socket.setdefaulttimeout(3)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((host, port))
+                sock.close()
+                self.logger.debug(f"Internet connectivity confirmed via {host}:{port}")
+                self._internet_available = True
+                return True
+            except (socket.error, socket.timeout, socket.gaierror):
+                continue
+        
+        self.logger.info("No internet connectivity detected - running in offline mode")
+        self._internet_available = False
+        return False
         
     def initialize_whisper(self):
         """Initialize the Whisper model with batched inference"""
         try:
             self.logger.info("Initializing Whisper model with batched inference...")
             # Try to use GPU if available
-            device = "cuda"
+            device = "cuda" if self._check_cuda() else "cpu"
             compute_type = "float16" if device == "cuda" else "int8"
             
-            # Read batch size from environment (default 16)
-            batch_size = int(os.getenv('WHISPER_BATCH_SIZE', '16'))
+            # Determine batch size: prefer instance setting, fall back to env or default
+            if getattr(self, 'whisper_batch_size', None):
+                batch_size = int(self.whisper_batch_size)
+            else:
+                batch_size = int(os.getenv('WHISPER_BATCH_SIZE', '8'))
             
-            self.logger.info(f"Using device: {device}, compute_type: {compute_type}, batch_size: {batch_size}")
+            # Get model size from environment or use default
+            model_size = os.getenv('WHISPER_MODEL', 'small')
+            
+            self.logger.info(f"Using device: {device}, compute_type: {compute_type}, batch_size: {batch_size}, model: {model_size}")
             
             # Initialize base model
+            # The download_root parameter ensures models are stored in a persistent location
+            # Models will be downloaded on first run and cached for offline use
             base_model = WhisperModel(
-                "small",  # You can make this configurable
+                model_size,
                 device=device,
-                compute_type=compute_type
+                compute_type=compute_type,
+                download_root=os.getenv('WHISPER_CACHE_DIR', None)  # Uses default cache if not set
             )
             
             # Wrap with batched inference pipeline
             self.whisper_model = BatchedInferencePipeline(model=base_model)
+            # store resolved batch size
             self.whisper_batch_size = batch_size
             
             self.logger.info("Whisper model with batched inference initialized successfully")
@@ -95,17 +161,89 @@ class WorkerClient:
             return False
 
     def initialize_translation(self):
-        """Initialize the EasyNMT translation model"""
+        """Initialize the EasyNMT translation model and pre-download common OPUS-MT models"""
         try:
             self.logger.info("Initializing EasyNMT translation model...")
             
-            # Download required NLTK data if not already present
+            # Check internet connectivity
+            has_internet = self._check_internet_connectivity()
+            
+            # Download required NLTK data if not already present (offline-safe)
             try:
                 import nltk
-                nltk.download('punkt_tab', quiet=True)
-                self.logger.debug("NLTK punkt_tab data downloaded/verified")
+                try:
+                    nltk.data.find('tokenizers/punkt_tab')
+                    self.logger.debug("NLTK punkt_tab data already available")
+                except LookupError:
+                    if has_internet:
+                        self.logger.debug("Attempting to download NLTK punkt_tab data...")
+                        nltk.download('punkt_tab', quiet=True, raise_on_error=False)
+                    else:
+                        self.logger.debug("Skipping NLTK download (offline mode)")
             except Exception as e:
-                self.logger.warning(f"Failed to download NLTK data (translation may still work): {e}")
+                self.logger.warning(f"NLTK data check failed (translation may still work): {e}")
+            
+            # Pre-download common OPUS-MT models to avoid runtime delays (offline-safe)
+            if has_internet:
+                self.logger.info("Pre-downloading common OPUS-MT translation models...")
+                common_models = [
+                    "Helsinki-NLP/opus-mt-fr-en",  # French → English
+                    "Helsinki-NLP/opus-mt-es-en",  # Spanish → English
+                    "Helsinki-NLP/opus-mt-de-en",  # German → English
+                    "Helsinki-NLP/opus-mt-it-en",  # Italian → English
+                    "Helsinki-NLP/opus-mt-ru-en",  # Russian → English
+                    "Helsinki-NLP/opus-mt-uk-en",  # Ukrainian → English
+                    "Helsinki-NLP/opus-mt-zh-en",  # Chinese → English
+                    "Helsinki-NLP/opus-mt-pl-en",  # Polish → English
+                    "Helsinki-NLP/opus-mt-ar-en",  # Arabic → English
+                    "Helsinki-NLP/opus-mt-hi-en",  # Hindi → English
+                ]
+                
+                try:
+                    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+                    import requests.exceptions
+                    downloaded_count = 0
+                    failed_count = 0
+                    
+                    for model_id in common_models:
+                        short_name = model_id.split("/")[-1]
+                        try:
+                            self.logger.debug(f"Downloading {short_name}...")
+                            # Set timeout and disable retries to fail fast if network is unavailable
+                            AutoTokenizer.from_pretrained(
+                                model_id, 
+                                local_files_only=False,
+                                force_download=False
+                            )
+                            AutoModelForSeq2SeqLM.from_pretrained(
+                                model_id, 
+                                local_files_only=False,
+                                force_download=False
+                            )
+                            downloaded_count += 1
+                            self.logger.debug(f"✓ Cached {short_name}")
+                        except (requests.exceptions.ConnectionError, 
+                                requests.exceptions.Timeout,
+                                OSError) as e:
+                            failed_count += 1
+                            # Check if model exists locally
+                            try:
+                                AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+                                self.logger.debug(f"Using cached {short_name}")
+                            except:
+                                self.logger.debug(f"Could not download {short_name} (not cached)")
+                        except Exception as e:
+                            failed_count += 1
+                            self.logger.debug(f"Could not download {short_name}: {type(e).__name__}")
+                    
+                    if downloaded_count > 0:
+                        self.logger.info(f"Pre-downloaded {downloaded_count}/{len(common_models)} OPUS-MT models")
+                    if failed_count == len(common_models):
+                        self.logger.warning("Could not download any models (using cached models if available)")
+                except Exception as e:
+                    self.logger.warning(f"Error during model pre-download (will use cached models if available): {e}")
+            else:
+                self.logger.info("Skipping model download (offline mode - using cached models)")
             
             # Use a lightweight model suitable for general translation
             # Options: 'opus-mt', 'mbart50_m2m', 'm2m_100_418M', 'm2m_100_1.2B'
@@ -116,52 +254,6 @@ class WorkerClient:
             self.logger.error(f"Failed to initialize EasyNMT model: {e}")
             self.logger.warning("Translation will be disabled for this worker")
             return False
-
-    def start_task_notification_listener(self):
-        """Listen on PostgreSQL NOTIFY channel 'new_task' and queue tasks quickly (optional)."""
-        try:
-            import psycopg2
-            import psycopg2.extensions
-            import json
-            import select
-
-            db_config = {
-                'host': os.getenv('POSTGRES_HOST', 'localhost'),
-                'port': int(os.getenv('POSTGRES_PORT', 5432)),
-                'database': os.getenv('POSTGRES_DATABASE', 'whisperwatch'),
-                'user': os.getenv('POSTGRES_USER', 'whisperwatch_user'),
-                'password': os.getenv('POSTGRES_PASSWORD', 'testpassword'),
-            }
-
-            self.notification_conn = psycopg2.connect(**db_config)
-            self.notification_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
-            cur = self.notification_conn.cursor()
-            cur.execute("LISTEN new_task")
-            self.listening_for_tasks = True
-            self.logger.info("Listening for PostgreSQL task notifications on channel 'new_task'")
-
-            while self.running and self.listening_for_tasks:
-                # Wait using select on the connection
-                if select.select([self.notification_conn], [], [], 1) == ([], [], []):
-                    continue
-                self.notification_conn.poll()
-                while self.notification_conn.notifies:
-                    notify = self.notification_conn.notifies.pop(0)
-                    try:
-                        _ = json.loads(notify.payload)
-                    except Exception:
-                        pass
-                    # Try to fetch and queue a task
-                    self.try_get_and_queue_task()
-        except Exception as e:
-            self.logger.warning(f"Task notification listener stopped: {e}")
-        finally:
-            self.listening_for_tasks = False
-            try:
-                if self.notification_conn:
-                    self.notification_conn.close()
-            except Exception:
-                pass
 
     def try_get_and_queue_task(self):
         try:
@@ -644,7 +736,7 @@ class WorkerClient:
                 transcription = {
                     "dtg": dtg,
                     "frequency": frequency,
-                    "language": getattr(info, 'language', ''),
+                    "language": "",  # No language when there's no content
                     "duration": total_duration,
                     "transcript": "",
                     "transcript_original": "",
@@ -662,7 +754,7 @@ class WorkerClient:
                 transcription = {
                     "dtg": dtg,
                     "frequency": frequency,
-                    "language": getattr(info, 'language', ''),
+                    "language": "",  # No language for filtered content
                     "duration": total_duration,
                     "transcript": "",
                     "transcript_original": "",
@@ -677,7 +769,7 @@ class WorkerClient:
                 transcription = {
                     "dtg": dtg,
                     "frequency": frequency,
-                    "language": getattr(info, 'language', ''),
+                    "language": "",  # No language for filtered content
                     "duration": total_duration,
                     "transcript": "",
                     "transcript_original": "",
@@ -692,7 +784,7 @@ class WorkerClient:
                 transcription = {
                     "dtg": dtg,
                     "frequency": frequency,
-                    "language": getattr(info, 'language', ''),
+                    "language": "",  # No language for low-confidence content
                     "duration": total_duration,
                     "transcript": "",
                     "transcript_original": "",
@@ -823,10 +915,6 @@ class WorkerClient:
         producer_thread = threading.Thread(target=self.task_producer, daemon=True)
         producer_thread.start()
         
-        # Start Postgres LISTEN/NOTIFY task listener if DB env is present
-        if os.getenv('POSTGRES_HOST'):
-            threading.Thread(target=self.start_task_notification_listener, daemon=True).start()
-
         # Start worker threads
         worker_threads = []
         for i in range(self.max_concurrent):
@@ -868,28 +956,66 @@ class WorkerClient:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="WhisperWorker Client")
-    parser.add_argument("--server-url", required=True, help="WhisperWatch server URL")
-    parser.add_argument("--username", required=True, help="Username for authentication")
-    parser.add_argument("--password", required=True, help="Password for authentication")
-    parser.add_argument("--worker-name", required=True, help="Worker ID/name")
-    parser.add_argument("--max-concurrent", type=int, default=4, help="Max concurrent tasks (1-10, default: 4)")
-    parser.add_argument("--whisper-batch-size", type=int, default=16, help="Batch size for Whisper model (default: 16)")
+    # If no CLI parameters are provided, enter interactive mode
+    if len(sys.argv) == 1:
+        print("WhisperWorker Configuration")
+        print("=" * 50)
+        # interactive prompts (allow environment variables as defaults)
+        server_url = input("Enter WhisperWatch URL: ").strip()
+        username = input("Enter username: ").strip()
+        password = input("Enter password: ").strip()
+        worker_name = input("Enter worker name: ").strip()
+        max_concurrent_str = input("Enter max concurrent threads (1-10) [allow more for larger GPUs, default 4]: ").strip()
+        whisper_batch_str = input("Enter Whisper batch size (1-16) [allow more for larger GPUs, default 8]: ").strip()
+        try:
+            max_concurrent = int(max_concurrent_str) if max_concurrent_str else 4
+        except Exception:
+            print("Invalid max concurrent, defaulting to 4")
+            max_concurrent = 4
+        try:
+            whisper_batch_size = int(whisper_batch_str) if whisper_batch_str else 8
+        except Exception:
+            print("Invalid whisper batch size, defaulting to 8")
+            whisper_batch_size = 8
+        print("=" * 50)
+    else:
+        parser = argparse.ArgumentParser(description="WhisperWorker")
+        parser.add_argument("--server-url", required=True, help="WhisperWatch server URL")
+        parser.add_argument("--username", required=True, help="Username for authentication")
+        parser.add_argument("--password", required=True, help="Password for authentication")
+        parser.add_argument("--worker-name", required=True, help="Worker ID/name")
+        parser.add_argument("--max-concurrent", type=int, default=4, help="Max concurrent tasks (1-10, default: 4)")
+        parser.add_argument("--whisper-batch-size", type=int, default=8, help="Batch size for Whisper batched inference (1-16, default: 8)")
+        args = parser.parse_args()
+
+        server_url = args.server_url
+        username = args.username
+        password = args.password
+        worker_name = args.worker_name
+        max_concurrent = args.max_concurrent
     # Speaker ID functionality removed; worker runs in transcription-only mode
     # parser.add_argument("--worker-secret", help="Optional worker secret to authenticate /api/workers/audio downloads")
 
-    args = parser.parse_args()
-
-    if args.max_concurrent < 1 or args.max_concurrent > 10:
+    if max_concurrent < 1 or max_concurrent > 10:
         print("Error: Max concurrent must be between 1 and 10")
         return 1
 
+    # Determine whisper_batch_size from args (if present) or interactive variable
+    try:
+        whisper_batch_size_arg = args.whisper_batch_size
+    except Exception:
+        # args may not exist in interactive mode
+        whisper_batch_size_arg = None
+
+    whisper_batch_size = whisper_batch_size_arg if whisper_batch_size_arg is not None else (locals().get('whisper_batch_size', None))
+
     worker = WorkerClient(
-        args.server_url,
-        args.worker_name,
-        args.max_concurrent,
-        args.username,
-        args.password,
+        server_url,
+        worker_name,
+        max_concurrent,
+        username,
+        password,
+        whisper_batch_size=whisper_batch_size,
     )
 
     return worker.run()

@@ -1,0 +1,10 @@
+faster-whisper
+requests
+nanoid
+transformers <5,>=4.4
+sentencepiece
+tqdm
+nltk
+sacremoses
+fasttext-wheel
+hf_xet

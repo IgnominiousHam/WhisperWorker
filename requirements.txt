@@ -4,3 +4,5 @@ torch
 nanoid
 easynmt
 nltk
+sacremoses
+hf_xet
