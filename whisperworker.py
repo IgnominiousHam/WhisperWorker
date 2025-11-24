@@ -70,6 +70,9 @@ class WorkerClient:
         self.notification_conn = None
         # Cache internet connectivity status
         self._internet_available = None
+        # Track tasks currently being processed to prevent duplicates
+        self._active_tasks = set()  # Set of task identifiers (filename or task_id)
+        self._active_tasks_lock = threading.Lock()
 
         # Setup logging
         logging.basicConfig(
@@ -184,7 +187,10 @@ class WorkerClient:
                 self.logger.warning(f"NLTK data check failed (translation may still work): {e}")
             
             # Pre-download common OPUS-MT models to avoid runtime delays (offline-safe)
-            if has_internet:
+            # Skip if user opted out via SKIP_OPUS_DOWNLOAD environment variable
+            skip_download = os.getenv('SKIP_OPUS_DOWNLOAD', '').lower() in ('1', 'true', 'yes')
+            
+            if has_internet and not skip_download:
                 self.logger.info("Pre-downloading common OPUS-MT translation models...")
                 common_models = [
                     "Helsinki-NLP/opus-mt-fr-en",  # French → English
@@ -242,6 +248,8 @@ class WorkerClient:
                         self.logger.warning("Could not download any models (using cached models if available)")
                 except Exception as e:
                     self.logger.warning(f"Error during model pre-download (will use cached models if available): {e}")
+            elif skip_download:
+                self.logger.info("Skipping model download (user opted out - using cached models)")
             else:
                 self.logger.info("Skipping model download (offline mode - using cached models)")
             
@@ -354,17 +362,30 @@ class WorkerClient:
     def process_task_worker(self):
         """Worker thread that processes individual tasks"""
         while self.running:
+            task = None
+            task_identifier = None
             try:
                 # Get a task from the queue
                 task = self._task_queue.get(timeout=5)
+                
+                # Create unique identifier for this task
+                filename = task.get("filename")
+                task_id = task.get("id")
+                task_identifier = str(task_id) if task_id is not None else filename
+                
+                # Check if this task is already being processed
+                with self._active_tasks_lock:
+                    if task_identifier in self._active_tasks:
+                        self.logger.warning(f"Task {task_identifier} is already being processed, skipping duplicate")
+                        self._task_queue.task_done()
+                        continue
+                    self._active_tasks.add(task_identifier)
                 
                 with self._workers_lock:
                     self._active_workers += 1
                 
                 try:
                     label = task.get('id') or task.get('filename') or 'unknown'
-                    filename = task.get("filename")
-                    task_id = task.get("id")
                     file_path = task.get("file_path")
                     if not file_path and filename:
                         # Construct a path for legacy download fallback if needed
@@ -420,6 +441,11 @@ class WorkerClient:
                             pass
                 
                 finally:
+                    # Remove task from active set
+                    if task_identifier:
+                        with self._active_tasks_lock:
+                            self._active_tasks.discard(task_identifier)
+                    
                     with self._workers_lock:
                         self._active_workers -= 1
                     self._task_queue.task_done()
@@ -430,8 +456,31 @@ class WorkerClient:
             except Exception as e:
                 self.logger.error(f"Error in worker thread: {e}")
                 self.logger.error(traceback.format_exc())
+                
+                # Try to report failure to server
+                if task:
+                    try:
+                        filename = task.get("filename")
+                        task_id = task.get("id")
+                        if task_id is not None:
+                            self.submit_result(task_id, False, error_message=f"Worker exception: {str(e)[:200]}")
+                        elif filename:
+                            self.submit_transcription_result_filename(filename, False, error_message=f"Worker exception: {str(e)[:200]}")
+                    except Exception as submit_error:
+                        self.logger.error(f"Failed to report error to server: {submit_error}")
+                
+                # Remove task from active set
+                if task_identifier:
+                    with self._active_tasks_lock:
+                        self._active_tasks.discard(task_identifier)
+                
                 with self._workers_lock:
                     self._active_workers -= 1
+                # Mark task as done even on error to prevent queue blocking
+                try:
+                    self._task_queue.task_done()
+                except:
+                    pass
                     
     def get_task(self) -> Optional[Dict]:
         """Get a task from the server"""
@@ -967,6 +1016,8 @@ def main():
         worker_name = input("Enter worker name: ").strip()
         max_concurrent_str = input("Enter max concurrent threads (1-10) [allow more for larger GPUs, default 4]: ").strip()
         whisper_batch_str = input("Enter Whisper batch size (1-16) [allow more for larger GPUs, default 8]: ").strip()
+        download_models_str = input("Download OPUS-MT translation models now? (y/n) [default: y]: ").strip().lower()
+        download_models = download_models_str != 'n' if download_models_str else True
         try:
             max_concurrent = int(max_concurrent_str) if max_concurrent_str else 4
         except Exception:
@@ -978,6 +1029,10 @@ def main():
             print("Invalid whisper batch size, defaulting to 8")
             whisper_batch_size = 8
         print("=" * 50)
+        
+        # Set environment variable to control model downloads
+        if not download_models:
+            os.environ['SKIP_OPUS_DOWNLOAD'] = '1'
     else:
         parser = argparse.ArgumentParser(description="WhisperWorker")
         parser.add_argument("--server-url", required=True, help="WhisperWatch server URL")
