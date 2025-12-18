@@ -957,6 +957,8 @@ class WorkerClient:
             
         self.running = True
         last_heartbeat = 0
+        consecutive_heartbeat_failures = 0
+        is_registered = True
         
         self.logger.info(f"Worker is now running with {self.max_concurrent} concurrent task processors")
         
@@ -979,8 +981,27 @@ class WorkerClient:
                 if current_time - last_heartbeat > 30:
                     if self.send_heartbeat():
                         last_heartbeat = current_time
+                        # Reset failure counter on success
+                        consecutive_heartbeat_failures = 0
+                        if not is_registered:
+                            is_registered = True
+                            self.logger.info("Heartbeat resumed successfully")
                     else:
-                        self.logger.warning("Heartbeat failed, will retry")
+                        consecutive_heartbeat_failures += 1
+                        self.logger.warning(f"Heartbeat failed ({consecutive_heartbeat_failures} consecutive failures)")
+                        # Mark as unregistered after 3 consecutive failures
+                        if consecutive_heartbeat_failures == 3:
+                            self.logger.warning("Lost connection to server (3+ heartbeat failures), will attempt to re-register")
+                            is_registered = False
+                        # Attempt to re-register if we're unregistered (try every 5 failures to avoid spam)
+                        if not is_registered and consecutive_heartbeat_failures % 5 == 0:
+                            self.logger.info(f"Attempting to re-register worker (attempt {consecutive_heartbeat_failures // 5})...")
+                            if self.register_worker():
+                                is_registered = True
+                                consecutive_heartbeat_failures = 0
+                                self.logger.info("Re-registration successful, resuming normal operation")
+                            else:
+                                self.logger.warning("Re-registration failed, will retry")
                 
                 # Log status every 60 seconds
                 with self._workers_lock:
