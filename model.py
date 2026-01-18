@@ -15,6 +15,7 @@ models = [
     "Helsinki-NLP/opus-mt-ar-en",  # Arabic → English
     "Helsinki-NLP/opus-mt-hi-en",  # Hindi → English
     "Helsinki-NLP/opus-mt-pl-en",  # Polish → English
+    "Helsinki-NLP/opus-mt-fi-en",  # Finnish → English
 ]
 
 print(f"📦 Preparing to download {len(models)} OPUS-MT models...\n")
